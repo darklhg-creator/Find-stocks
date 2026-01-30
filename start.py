@@ -13,8 +13,8 @@ TARGET_DATE = datetime.now().strftime("%Y%m%d")
 
 # [1단계 조건: 기준봉]
 CHECK_DAYS = 30           # 30일 이내
-FLAG_HIGH_RATE = 10.0     # 고가 기준 10% 이상 상승
-FLAG_VOL_RATE = 2.0       # 전일 대비 거래량 200%(2배) 이상
+FLAG_HIGH_RATE = 15.0     # 고가 기준 15% 이상 상승
+FLAG_VOL_RATE = 3.0       # 전일 대비 거래량 300%(3배) 이상
 
 # [2단계 조건: 이격도]
 DISPARITY_LIMIT = 95.0    # 20일선 이격도 95% 이하 (과대낙폭)
@@ -199,3 +199,4 @@ else:
 
 send_discord_message(DISCORD_WEBHOOK_URL, msg)
 print("✅ 전송 완료")
+
