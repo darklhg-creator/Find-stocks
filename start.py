@@ -6,193 +6,196 @@ from datetime import datetime, timedelta
 import time
 
 # ==========================================
-# 1. 사용자 설정 (놓침 방지 완화 버전)
+# 0. 설정값 (사용자 요청 사항 반영)
 # ==========================================
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1466732864392397037/roekkL5WS9fh8uQnm6Bjcul4C8MDo1gsr1ZmzGh8GfuomzlJ5vpZdVbCaY--_MZOykQ4"
-
 TARGET_DATE = datetime.now().strftime("%Y%m%d")
 
-# [A. 기준봉(폭발) 조건] - 조금 더 현실적으로 수정
-CHECK_DAYS = 30           # 최근 30일 이내
-FLAG_PRICE_RATE = 10.0    # 10% 이상 주가 급등 (그대로 유지)
-FLAG_VOL_RATE = 3.0       # 전일 대비 300%(3배) 이상 (5배->3배로 완화하여 포착률 높임)
+# [1단계 조건: 기준봉]
+CHECK_DAYS = 30           # 30일 이내
+FLAG_HIGH_RATE = 10.0     # 고가 기준 10% 이상 상승
+FLAG_VOL_RATE = 2.0       # 전일 대비 거래량 200%(2배) 이상
 
-# [B. 눌림목(침묵) 조건] - 숨 쉴 구멍 주기
-QUIET_VOL_RATIO = 0.35    # 기준봉 대비 35% 이하 (25%->35%로 여유 줌)
+# [2단계 조건: 이격도]
+DISPARITY_LIMIT = 95.0    # 20일선 이격도 95% 이하 (과대낙폭)
 
-print(f"[{TARGET_DATE}] '폭발 후 침묵' 정밀 분석 시작")
-print(f"조건: 30일내 {int(FLAG_PRICE_RATE)}%↑/3배 거래량 → 이후 거래량 {int(QUIET_VOL_RATIO*100)}% 이하 유지")
+# [3단계 조건: 거래량 침묵]
+QUIET_VOL_RATIO = 0.5     # 기준봉 거래량 대비 50% 이하 유지
+
+print(f"[{TARGET_DATE}] 3단계 정밀 분석 시작 (코스피/닥 시총 상위 500개)")
 print("-" * 60)
 
 # ==========================================
-# 2. 함수 정의
+# 함수 정의
 # ==========================================
 def send_discord_message(webhook_url, content):
-    data = {"content": content}
-    headers = {"Content-Type": "application/json"}
-    try:
-        requests.post(webhook_url, data=json.dumps(data), headers=headers)
-    except:
-        pass
+    """디스코드 메시지를 끊어서 전송 (2000자 제한 방지)"""
+    if len(content) > 1900:
+        chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]
+        for chunk in chunks:
+            data = {"content": chunk}
+            headers = {"Content-Type": "application/json"}
+            requests.post(webhook_url, data=json.dumps(data), headers=headers)
+            time.sleep(0.5)
+    else:
+        data = {"content": content}
+        headers = {"Content-Type": "application/json"}
+        try:
+            requests.post(webhook_url, data=json.dumps(data), headers=headers)
+        except:
+            pass
 
-def get_target_tickers(date):
-    """코스피 500 + 코스닥 1000 (총 1500개)"""
-    print("1. 검색 대상 리스트 확보 중...")
+def get_top_tickers(date):
+    """코스피 500 + 코스닥 500 (ETF 제외)"""
+    print("0. 종목 리스트 확보 중...")
     try:
-        df_kospi = stock.get_market_cap(date, market="KOSPI")
-        top_kospi = df_kospi.sort_values(by='시가총액', ascending=False).head(500).index.tolist()
+        kospi = stock.get_market_cap(date, market="KOSPI").sort_values(by='시가총액', ascending=False).head(500).index.tolist()
+        kosdaq = stock.get_market_cap(date, market="KOSDAQ").sort_values(by='시가총액', ascending=False).head(500).index.tolist()
         
-        df_kosdaq = stock.get_market_cap(date, market="KOSDAQ")
-        top_kosdaq = df_kosdaq.sort_values(by='시가총액', ascending=False).head(1000).index.tolist()
-        
-        total_tickers = top_kospi + top_kosdaq
+        tickers = kospi + kosdaq
         etfs = stock.get_etf_ticker_list(date)
         etns = stock.get_etn_ticker_list(date)
-        exclude_list = set(etfs + etns)
+        exclude = set(etfs + etns)
         
-        return [t for t in total_tickers if t not in exclude_list]
+        return [t for t in tickers if t not in exclude]
     except:
         return []
 
 # ==========================================
-# 3. 메인 분석 로직
+# 메인 로직
 # ==========================================
-tickers = get_target_tickers(TARGET_DATE)
-print(f"   -> 분석 대상: {len(tickers)}개 종목")
+tickers = get_top_tickers(TARGET_DATE)
+print(f"-> 총 검사 대상: {len(tickers)}개")
 
-results = []
-print("2. 패턴 매칭 시작...")
+# 결과 저장용 리스트
+step1_list = [] # 기준봉 발견
+step2_list = [] # 이격도 95 이하
+step3_list = [] # 거래량 침묵 (최종)
 
 count = 0
 for ticker in tickers:
     count += 1
-    if count % 100 == 0: print(f"   ... {count}개 완료")
+    if count % 100 == 0: print(f"... {count}개 분석 중")
 
     try:
-        # 데이터 넉넉히 가져오기
+        # 데이터 가져오기 (이평선 계산 위해 60일치)
         start_date = (datetime.strptime(TARGET_DATE, "%Y%m%d") - timedelta(days=60)).strftime("%Y%m%d")
         ohlcv = stock.get_market_ohlcv_by_date(start_date, TARGET_DATE, ticker)
         
         if len(ohlcv) < 40: continue
 
-        # 최근 30일 데이터 (오늘 포함)
+        # 최근 30일 데이터 슬라이싱 (오늘 포함)
         recent_data = ohlcv.iloc[-(CHECK_DAYS+1):]
         
-        found_trigger = False
-        trigger_date = ""
-        trigger_vol = 0
-        trigger_price_change = 0.0
-        
-        # ---------------------------------------------------------
-        # Step 1. 기준봉(Trigger) 찾기
-        # ---------------------------------------------------------
-        # 최근 날짜부터 거꾸로 찾아서 '가장 최근의 폭발'을 기준으로 삼음
-        # (과거에 여러 번 폭발했어도, 지금 눌림목을 만든 '그 녀석'이 중요하므로)
-        for i in range(len(recent_data) - 2, 0, -1): # 오늘(마지막) 제외하고 역순 탐색
-            curr_idx = i
-            prev_idx = i - 1
-            
-            curr_vol = recent_data['거래량'].iloc[curr_idx]
-            prev_vol = recent_data['거래량'].iloc[prev_idx]
-            curr_close = recent_data['종가'].iloc[curr_idx]
-            prev_close = recent_data['종가'].iloc[prev_idx]
-            
-            if prev_close == 0 or prev_vol == 0: continue
-            
-            price_rate = (curr_close - prev_close) / prev_close * 100
-            vol_rate = curr_vol / prev_vol
-            
-            # [조건] 10% 이상 상승 AND 3배 이상 거래량
-            if price_rate >= FLAG_PRICE_RATE and vol_rate >= FLAG_VOL_RATE:
-                found_trigger = True
-                trigger_date = recent_data.index[curr_idx].strftime("%Y-%m-%d")
-                trigger_vol = curr_vol
-                trigger_price_change = price_rate
-                
-                # 기준봉 이후 데이터 슬라이싱
-                post_trigger_data = recent_data.iloc[curr_idx+1:]
-                break # 가장 최근 기준봉 발견하면 스톱
+        # ---------------------------------------------------
+        # [Step 1] 기준봉 찾기 (30일 내 10% 상승 & 200% 거래량)
+        # ---------------------------------------------------
+        found_flag = False
+        trigger_date_idx = -1   # 기준봉 날짜의 인덱스
+        trigger_vol = 0         # 기준봉 거래량
+        trigger_name = ""
 
-        if not found_trigger: continue
-        
-        # 기준봉이 오늘 터진 거라면 눌림목 확인 불가하므로 패스
-        if len(post_trigger_data) == 0: continue
+        # 가장 '최근'에 발생한 기준봉을 찾음
+        for i in range(len(recent_data)-1, 0, -1): # 역순 탐색
+            curr_row = recent_data.iloc[i]
+            prev_row = recent_data.iloc[i-1]
+            
+            # 전일 종가 (0이면 패스)
+            prev_close = prev_row['종가']
+            if prev_close == 0 or prev_row['거래량'] == 0: continue
 
-        # ---------------------------------------------------------
-        # Step 2. 눌림목(Quiet) 검증
-        # ---------------------------------------------------------
+            # 조건: 고가 기준 10% 이상 상승 AND 거래량 200%(2배) 이상
+            high_rate = (curr_row['고가'] - prev_close) / prev_close * 100
+            vol_rate = curr_row['거래량'] / prev_row['거래량']
+
+            if high_rate >= FLAG_HIGH_RATE and vol_rate >= FLAG_VOL_RATE:
+                found_flag = True
+                trigger_date_idx = i
+                trigger_vol = curr_row['거래량']
+                break # 최근 기준봉 하나 찾으면 중단
+
+        if found_flag:
+            name = stock.get_market_ticker_name(ticker)
+            step1_list.append(name) # 1단계 통과
+        else:
+            continue # 1단계 탈락이면 다음 종목으로
+
+        # ---------------------------------------------------
+        # [Step 2] 이격도 95% 이하 확인 (1단계 통과한 놈만)
+        # ---------------------------------------------------
+        # 오늘 종가 / 20일 이동평균선 * 100
+        curr_close = ohlcv['종가'].iloc[-1]
+        ma20 = ohlcv['종가'].rolling(window=20).mean().iloc[-1]
+        
+        if ma20 == 0: continue
+        disparity = (curr_close / ma20) * 100
+
+        if disparity <= DISPARITY_LIMIT:
+            step2_list.append(f"{name}({round(disparity,1)}%)") # 2단계 통과
+        else:
+            continue # 2단계 탈락
+
+        # ---------------------------------------------------
+        # [Step 3] 거래량 침묵 확인 (2단계 통과한 놈만)
+        # ---------------------------------------------------
+        # 기간: 기준봉 다음날 ~ 오늘
+        # 기준봉이 오늘이면(방금 터진거면) 눌림목 기간이 없으므로 제외할 수도 있으나,
+        # 여기선 데이터가 없으므로 자동 통과 or 제외 선택. 보통 제외함.
+        
+        # 기준봉이 recent_data 내에서의 인덱스가 trigger_date_idx
+        # 검사 구간: trigger_date_idx + 1 부터 끝까지
+        check_range = recent_data.iloc[trigger_date_idx+1 : ]
+        
+        if len(check_range) == 0: 
+            continue # 기준봉이 오늘 터진거라 눌림목 확인 불가 -> 제외
+
         is_quiet = True
-        current_vol_ratio = 0.0
-        
-        for i in range(len(post_trigger_data)):
-            daily_vol = post_trigger_data['거래량'].iloc[i]
-            
-            # 하루라도 기준봉의 35%를 넘으면 탈락
-            # (단, 오늘이 양봉이면서 거래량이 살짝 붙는 건 '반등 시작'일 수 있어서 봐줄 수도 있지만
-            #  여기서는 일단 엄격하게 '거래량 죽어있는지'만 봅니다)
-            if daily_vol > (trigger_vol * QUIET_VOL_RATIO):
+        for vol in check_range['거래량']:
+            # 하루라도 기준봉 거래량의 50%를 넘으면 탈락
+            if vol > (trigger_vol * QUIET_VOL_RATIO):
                 is_quiet = False
                 break
-            
-            if i == len(post_trigger_data) - 1: # 마지막 날
-                current_vol_ratio = (daily_vol / trigger_vol) * 100
-
-        if not is_quiet: continue
-            
-        # ---------------------------------------------------------
-        # Step 3. 수급 및 저장
-        # ---------------------------------------------------------
-        supply_start = (datetime.strptime(TARGET_DATE, "%Y%m%d") - timedelta(days=7)).strftime("%Y%m%d")
-        supply_df = stock.get_market_net_purchases_of_equities_by_date(supply_start, TARGET_DATE, ticker)
-        recent_supply = supply_df.tail(5)
         
-        inst_sum = int(recent_supply['기관합계'].sum())
-        for_sum = int(recent_supply['외국인'].sum())
-        name = stock.get_market_ticker_name(ticker)
-        
-        results.append({
-            '종목명': name,
-            '현재가': ohlcv['종가'].iloc[-1],
-            '기준일': trigger_date,
-            '기준상승': f"{round(trigger_price_change,1)}%",
-            '현재거래비율': f"{round(current_vol_ratio,1)}%",
-            '기관수급': inst_sum,
-            '외인수급': for_sum
-        })
+        if is_quiet:
+            step3_list.append(f"{name}") # 3단계 최종 통과!
 
-    except:
+    except Exception as e:
         continue
 
 # ==========================================
-# 4. 결과 전송
+# 결과 전송
 # ==========================================
-print("\n" + "="*70)
-print(f"📊 분석 완료 ({len(results)}개 발견). 디스코드 전송...")
+print("\n분석 완료. 디스코드 전송 중...")
 
-if len(results) > 0:
-    res_df = pd.DataFrame(results)
-    res_df = res_df.sort_values(by='기준일', ascending=False)
+msg = f"## 🎯 {TARGET_DATE} 3단계 조건 검색 결과\n"
+msg += f"(대상: 코스피/닥 시총상위 500개)\n\n"
 
-    discord_msg = f"## 🌋 {TARGET_DATE} 폭발 후 침묵(눌림목) 발견\n"
-    discord_msg += f"**조건:** 10%↑/3배폭발 → 35%이하 침묵 (안전모드)\n\n"
-    
-    for idx, row in res_df.head(20).iterrows():
-        icon = "🤫"
-        if row['기관수급'] > 0 and row['외인수급'] > 0: icon = "🔥"
-        elif row['기관수급'] > 0: icon = "🔴"
-        elif row['외인수급'] > 0: icon = "🔵"
-
-        discord_msg += (
-            f"**{idx+1}. {row['종목명']}** {icon}\n"
-            f"> 가격: {row['현재가']:,}원 ({row['기준일']} 폭발)\n"
-            f"> 침묵: 기준봉 대비 거래량 **{row['현재거래비율']}**\n"
-            f"> 수급: 기 {row['기관수급']:,} / 외 {row['외인수급']:,}\n\n"
-        )
-    
-    send_discord_message(DISCORD_WEBHOOK_URL, discord_msg)
-    print("✅ 전송 완료!")
-
+# 1번 결과
+msg += f"**1️⃣ 기준봉 발생 ({len(step1_list)}개)**\n"
+msg += f"> 조건: 30일내 고가10%↑ & 거래량200%↑\n"
+if len(step1_list) > 0:
+    msg += f"Running list: {', '.join(step1_list[:30])}..." if len(step1_list) > 30 else f"{', '.join(step1_list)}"
 else:
-    msg = f"## 📉 {TARGET_DATE} 분석 결과\n조건에 맞는 종목이 없습니다.\n(시장 거래량이 전체적으로 말라있거나, 급등주가 없습니다.)"
-    send_discord_message(DISCORD_WEBHOOK_URL, msg)
-    print("검색된 종목 없음.")
+    msg += "없음"
+msg += "\n\n"
+
+# 2번 결과
+msg += f"**2️⃣ 과대낙폭 필터 ({len(step2_list)}개)**\n"
+msg += f"> 조건: 1번 중 이격도 95% 이하\n"
+if len(step2_list) > 0:
+    msg += f"{', '.join(step2_list)}"
+else:
+    msg += "없음"
+msg += "\n\n"
+
+# 3번 결과
+msg += f"**3️⃣ 거래량 침묵 (최종 Pick) ({len(step3_list)}개)** 🏆\n"
+msg += f"> 조건: 2번 중 거래량 50% 이하 유지\n"
+if len(step3_list) > 0:
+    for item in step3_list:
+        msg += f"- 💎 **{item}**\n"
+else:
+    msg += "조건을 모두 만족하는 종목이 없습니다."
+
+send_discord_message(DISCORD_WEBHOOK_URL, msg)
+print("✅ 전송 완료")
