@@ -2,7 +2,7 @@ import requests
 import json
 import pandas as pd
 from pykrx import stock
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import time
 import sys
 
@@ -10,7 +10,12 @@ import sys
 # 0. 사용자 설정
 # ==========================================
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1466732864392397037/roekkL5WS9fh8uQnm6Bjcul4C8MDo1gsr1ZmzGh8GfuomzlJ5vpZdVbCaY--_MZOykQ4"
-TARGET_DATE = datetime.now().strftime("%Y%m%d")
+
+# [핵심 수정] 시스템 시간이 아닌 '한국 시간(KST)'을 강제로 계산
+# UTC 시간에 9시간을 더해 한국 시간을 구합니다.
+KST_TIMEZONE = timezone(timedelta(hours=9))
+CURRENT_KST = datetime.now(KST_TIMEZONE)
+TARGET_DATE = CURRENT_KST.strftime("%Y%m%d")
 
 # [공통 조건]
 CHECK_DAYS = 30           # 30일 이내 탐색
@@ -25,15 +30,18 @@ COND_A_VOL = 2.0          # 200%(2배) 이상 폭발
 COND_B_PRICE = 15.0       # 15% 이상 급등
 COND_B_VOL = 3.0          # 300%(3배) 이상 폭발
 
-print(f"[{TARGET_DATE}] 주식 분석 프로그램 가동 시작")
+print(f"[{TARGET_DATE}] 주식 분석 프로그램 가동 시작 (한국시간 기준)")
 print("-" * 60)
 
 # ==========================================
 # [중요] 휴장일(주말/공휴일) 필터링 로직
 # ==========================================
 # 1. 주말 체크 (월:0 ~ 일:6)
+# TARGET_DATE가 이미 한국 시간으로 설정되었으므로 정확히 요일을 판단합니다.
 dt = datetime.strptime(TARGET_DATE, "%Y%m%d")
-if dt.weekday() >= 5:
+weekday = dt.weekday()
+
+if weekday >= 5:
     print(f"⏹️ 오늘은 주말(토/일)입니다. 프로그램을 종료합니다.")
     sys.exit()
 
@@ -78,7 +86,8 @@ def get_top_tickers(date):
     print("1. 종목 리스트 확보 중...")
     try:
         # 시가총액 데이터는 안전하게 '하루 전' 기준으로 가져옴 (장중 에러 방지)
-        safe_date = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        # 한국 시간 기준으로 하루 전 날짜 계산
+        safe_date = (datetime.strptime(date, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
         
         kospi = stock.get_market_cap(safe_date, market="KOSPI").sort_values(by='시가총액', ascending=False).head(500).index.tolist()
         kosdaq = stock.get_market_cap(safe_date, market="KOSDAQ").sort_values(by='시가총액', ascending=False).head(500).index.tolist()
