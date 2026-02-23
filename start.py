@@ -4,7 +4,7 @@ import pandas as pd
 from datetime import datetime, timedelta, timezone
 
 # ==========================================
-# ⚙️ 1. 환경 설정 (Configuration)
+# ⚙️ 1. 환경 설정
 # ==========================================
 WEBHOOK_URL = "https://discord.com/api/webhooks/1466732864392397037/roekkL5WS9fh8uQnm6Bjcul4C8MDo1gsr1ZmzGh8GfuomzlJ5vpZdVbCaY--_MZOykQ4"
 
@@ -23,35 +23,41 @@ class ETFTracker:
         self.df = pd.DataFrame()
 
     def fetch_data(self):
-        # 1. 영업일 목록 조회하여 오늘과 직전 거래일 정확히 찾기
+        # 1. 버전에 구애받지 않는 안전한 영업일 추출법
+        # 가장 거래가 활발한 KODEX 200(069500)의 최근 10일치 데이터를 불러와서
+        # 장이 열렸던 실제 날짜만 추출합니다.
         dt_end = datetime.strptime(self.target_date, "%Y%m%d")
         dt_start = dt_end - timedelta(days=10)
         
-        b_days = stock.get_business_days_dates(dt_start.strftime("%Y%m%d"), self.target_date)
+        df_days = stock.get_market_ohlcv(dt_start.strftime("%Y%m%d"), self.target_date, "069500")
+        
+        if df_days.empty:
+            raise ValueError("최근 장이 열린 기록을 찾을 수 없습니다.")
+            
+        b_days = df_days.index.strftime("%Y%m%d").tolist()
         
         if len(b_days) < 2:
             raise ValueError("영업일 데이터가 부족합니다.")
             
-        curr_date = b_days[-1].strftime("%Y%m%d")
-        prev_date = b_days[-2].strftime("%Y%m%d")
+        curr_date = b_days[-1]
+        prev_date = b_days[-2]
         
         print(f"📡 수집 기준일: {curr_date} / 비교일(전일): {prev_date}")
         
-        # 2. 오늘과 전일의 시세 데이터를 각각 통째로 수집 (등락률이 없어도 OK)
+        # 2. 오늘과 전일의 시세 데이터를 각각 통째로 수집
         df_curr = stock.get_etf_ohlcv_by_ticker(curr_date)
         df_prev = stock.get_etf_ohlcv_by_ticker(prev_date)
         
         if df_curr.empty or df_prev.empty:
-            raise ValueError("데이터를 불러오지 못했습니다.")
+            raise ValueError("해당 날짜의 ETF 데이터를 불러오지 못했습니다.")
             
-        # 3. Pandas Join 연산을 통한 고속 병합 및 자체 등락률 계산
-        # 인덱스(티커) 기준으로 두 데이터를 완벽하게 매칭시켜 숫자가 꼬이지 않음
+        # 3. Pandas Join 연산을 통한 고속 병합
         df_merged = df_curr[['종가', '거래대금']].join(df_prev[['종가']], lsuffix='_현재', rsuffix='_전일')
         
-        # 자체 계산식: ((오늘종가 - 어제종가) / 어제종가) * 100
+        # 4. 자체 등락률 계산: ((오늘종가 - 어제종가) / 어제종가) * 100
         df_merged['등락률'] = ((df_merged['종가_현재'] - df_merged['종가_전일']) / df_merged['종가_전일']) * 100
         
-        # 4. 종목명 추가
+        # 5. 종목명 추가
         df_merged['종목명'] = [stock.get_etf_ticker_name(t) for t in df_merged.index]
         
         self.df = df_merged
@@ -60,17 +66,17 @@ class ETFTracker:
     def process_data(self):
         df = self.df.copy()
         
-        # 1. 제외 키워드 필터링 (고속 문자열 연산)
+        # 1. 제외 키워드 필터링
         pattern = '|'.join(EXCLUDE_KEYWORDS)
         df = df[~df['종목명'].str.contains(pattern, na=False)]
         
-        # 2. 신규 상장 등으로 전일 데이터가 없어 등락률이 NaN인 종목 제거
+        # 2. 전일 데이터가 없거나 등락률이 비정상인 종목 제거
         df = df.dropna()
         
-        # 3. 상승률 0% 초과 종목만 필터링 후 정렬
+        # 3. 상승률 0% 초과 종목만 정렬
         top10_df = df[df['등락률'] > 0].sort_values(by='등락률', ascending=False).head(10)
         
-        # 4. 깔끔한 출력을 위한 리스트 조립
+        # 4. 리스트 조립
         results = []
         for _, row in top10_df.iterrows():
             results.append({
@@ -95,7 +101,6 @@ def send_discord(df_result, target_date):
         msg += "```text\n"
         msg += df_display.to_string(index=False) + "\n"
         msg += "```\n"
-        msg += "💡 Pandas 자체 병합 연산을 적용하여 정확도와 속도를 극대화했습니다."
 
     try:
         requests.post(WEBHOOK_URL, json={"content": msg})
