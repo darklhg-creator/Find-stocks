@@ -3,9 +3,7 @@ from pykrx import stock
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 
-# ==========================================
-# ⚙️ 1. 환경 설정
-# ==========================================
+# 🔴 디스코드 웹후크 URL
 WEBHOOK_URL = "https://discord.com/api/webhooks/1466732864392397037/roekkL5WS9fh8uQnm6Bjcul4C8MDo1gsr1ZmzGh8GfuomzlJ5vpZdVbCaY--_MZOykQ4"
 
 EXCLUDE_KEYWORDS = [
@@ -14,125 +12,98 @@ EXCLUDE_KEYWORDS = [
     '대만', '유로', '스톡스', '선물', '채권', '국고채', '머니마켓', 'KOFR', 'CD금리', '달러', '엔화'
 ]
 
-# ==========================================
-# 🛠️ 2. 핵심 기능 클래스 (ETF Data Pipeline)
-# ==========================================
-class ETFTracker:
-    def __init__(self, target_date):
-        self.target_date = target_date
-        self.df = pd.DataFrame()
+def send_discord_message(msg_content):
+    payload = {"content": msg_content}
+    try:
+        requests.post(WEBHOOK_URL, json=payload)
+    except Exception as e:
+        print(f"❌ 전송 에러: {e}")
 
-    def fetch_data(self):
-        # 1. 버전에 구애받지 않는 안전한 영업일 추출법
-        # 가장 거래가 활발한 KODEX 200(069500)의 최근 10일치 데이터를 불러와서
-        # 장이 열렸던 실제 날짜만 추출합니다.
-        dt_end = datetime.strptime(self.target_date, "%Y%m%d")
-        dt_start = dt_end - timedelta(days=10)
+def main():
+    KST = timezone(timedelta(hours=9))
+    today_dt = datetime.now(KST)
+    target_date = today_dt.strftime("%Y%m%d")
+    
+    # 주말 작동 방지
+    if today_dt.weekday() >= 5:
+        print("💤 주말입니다. 분석을 쉬어갑니다.")
+        return
+
+    try:
+        # 1. 영업일 조회 (KODEX 200 데이터 활용 - 에러 없는 가장 안전한 방식)
+        dt_start = (today_dt - timedelta(days=10)).strftime("%Y%m%d")
+        df_days = stock.get_market_ohlcv(dt_start, target_date, "069500")
         
-        df_days = stock.get_market_ohlcv(dt_start.strftime("%Y%m%d"), self.target_date, "069500")
-        
-        if df_days.empty:
-            raise ValueError("최근 장이 열린 기록을 찾을 수 없습니다.")
+        if df_days.empty or len(df_days) < 2:
+            print("❌ 장이 열린 날짜 데이터를 확인할 수 없습니다.")
+            return
             
         b_days = df_days.index.strftime("%Y%m%d").tolist()
+        curr_date = b_days[-1] # 오늘(또는 가장 최근 영업일)
+        prev_date = b_days[-2] # 어제(또는 그 직전 영업일)
         
-        if len(b_days) < 2:
-            raise ValueError("영업일 데이터가 부족합니다.")
-            
-        curr_date = b_days[-1]
-        prev_date = b_days[-2]
-        
-        print(f"📡 수집 기준일: {curr_date} / 비교일(전일): {prev_date}")
-        
-        # 2. 오늘과 전일의 시세 데이터를 각각 통째로 수집
+        print(f"📡 데이터 조회: 오늘({curr_date}) / 어제({prev_date})")
+
+        # 2. 어제와 오늘 데이터 각각 통째로 가져오기
         df_curr = stock.get_etf_ohlcv_by_ticker(curr_date)
         df_prev = stock.get_etf_ohlcv_by_ticker(prev_date)
         
         if df_curr.empty or df_prev.empty:
-            raise ValueError("해당 날짜의 ETF 데이터를 불러오지 못했습니다.")
-            
-        # 3. Pandas Join 연산을 통한 고속 병합
-        df_merged = df_curr[['종가', '거래대금']].join(df_prev[['종가']], lsuffix='_현재', rsuffix='_전일')
-        
-        # 4. 자체 등락률 계산: ((오늘종가 - 어제종가) / 어제종가) * 100
-        df_merged['등락률'] = ((df_merged['종가_현재'] - df_merged['종가_전일']) / df_merged['종가_전일']) * 100
-        
-        # 5. 종목명 추가
-        df_merged['종목명'] = [stock.get_etf_ticker_name(t) for t in df_merged.index]
-        
-        self.df = df_merged
-        print(f"✅ 수집 및 연산 완료 (총 {len(self.df)}개 종목)")
-        
-    def process_data(self):
-        df = self.df.copy()
-        
-        # 1. 제외 키워드 필터링
-        pattern = '|'.join(EXCLUDE_KEYWORDS)
-        df = df[~df['종목명'].str.contains(pattern, na=False)]
-        
-        # 2. 전일 데이터가 없거나 등락률이 비정상인 종목 제거
-        df = df.dropna()
-        
-        # 3. 상승률 0% 초과 종목만 정렬
-        top10_df = df[df['등락률'] > 0].sort_values(by='등락률', ascending=False).head(10)
-        
-        # 4. 리스트 조립
+            print("❌ 시세 데이터를 불러오지 못했습니다.")
+            return
+
         results = []
-        for _, row in top10_df.iterrows():
-            results.append({
-                '종목명': row['종목명'],
-                '상승률(%)': float(row['등락률']),
-                '거래대금(억)': round(float(row['거래대금_현재']) / 100_000_000, 1)
-            })
+
+        # 3. [유저 아이디어 반영] 직관적이고 확실한 직접 계산 로직
+        for ticker in df_curr.index:
+            # 어제 데이터가 없는 신규 상장 종목 등은 패스
+            if ticker not in df_prev.index:
+                continue
+                
+            name = stock.get_etf_ticker_name(ticker)
             
-        return pd.DataFrame(results)
+            # 필터링
+            if any(word in name for word in EXCLUDE_KEYWORDS): 
+                continue
+            
+            # 어제 종가, 오늘 종가, 오늘 거래대금 추출
+            prev_close = float(df_prev.loc[ticker, '종가'])
+            curr_close = float(df_curr.loc[ticker, '종가'])
+            curr_amt = float(df_curr.loc[ticker, '거래대금'])
+            
+            if prev_close == 0: continue # 에러 방지
+            
+            # 등락률 직접 계산
+            change_rate = ((curr_close - prev_close) / prev_close) * 100
+            
+            # 상승한 종목만 담기
+            if change_rate > 0:
+                results.append({
+                    '종목명': name,
+                    '상승률': change_rate,
+                    '거래대금(억)': round(curr_amt / 100_000_000, 1)
+                })
 
-# ==========================================
-# 🚀 3. 디스코드 전송 및 메인 실행
-# ==========================================
-def send_discord(df_result, target_date):
-    if df_result.empty:
-        msg = f"⚠️ **[{target_date}]** 조건에 맞는 상승 종목이 없습니다."
-    else:
-        df_display = df_result.copy()
-        df_display['상승률(%)'] = df_display['상승률(%)'].apply(lambda x: f"{x:.2f}%")
-        
-        msg = f"🚀 **[국내 주도주 ETF 상승률 TOP 10]** ({target_date})\n"
-        msg += "```text\n"
-        msg += df_display.to_string(index=False) + "\n"
-        msg += "```\n"
+        # 4. 결과 정렬 및 전송
+        if results:
+            final_df = pd.DataFrame(results).sort_values(by='상승률', ascending=False).head(10)
+            
+            # 소수점 2자리 포맷팅
+            final_df['상승률'] = final_df['상승률'].map(lambda x: f"{x:.2f}%")
 
-    try:
-        requests.post(WEBHOOK_URL, json={"content": msg})
-        print("✉️ 디스코드 메시지 전송 성공!")
-    except Exception as e:
-        print(f"❌ 전송 실패: {e}")
-
-def main():
-    KST = timezone(timedelta(hours=9))
-    today = datetime.now(KST)
-    
-    if today.weekday() >= 5:
-        print("💤 주말입니다. 분석을 쉬어갑니다.")
-        return
-
-    target_date = today.strftime("%Y%m%d")
-    display_date = today.strftime("%Y-%m-%d")
-
-    try:
-        tracker = ETFTracker(target_date)
-        tracker.fetch_data()
-        final_df = tracker.process_data()
-        
-        print("\n📊 [분석 결과]")
-        print(final_df)
-        
-        send_discord(final_df, display_date)
+            discord_msg = f"🚀 **[오늘의 국내 ETF 상승률 TOP 10]** ({today_dt.strftime('%Y-%m-%d')})\n"
+            discord_msg += "```text\n"
+            discord_msg += final_df.to_string(index=False) + "\n"
+            discord_msg += "```\n"
+            
+            send_discord_message(discord_msg)
+            print("✅ 분석 및 디스코드 전송 완료!")
+            print(final_df)
+        else:
+            print("⚠️ 조건에 맞는 상승 종목이 없습니다.")
 
     except Exception as e:
-        error_msg = f"❌ 시스템 에러: {e}"
-        print(error_msg)
-        requests.post(WEBHOOK_URL, json={"content": error_msg}) 
+        print(f"❌ 최종 오류 발생: {e}")
 
 if __name__ == "__main__":
     main()
