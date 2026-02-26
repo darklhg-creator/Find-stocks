@@ -1,4 +1,4 @@
-name: ETF Leader Tracker
+name: ETF Leader Tracker best
 
 on:
   schedule:
@@ -26,3 +26,4 @@ jobs:
 
     - name: 주도주 탐색 파이썬 스크립트 실행
       run: python start.py
+
