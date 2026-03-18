@@ -26,7 +26,7 @@ ADX_RISING_DAYS     = 3
 MIN_VOLUME_20D      = 100_000
 MAX_WORKERS         = 5
 DATA_PERIOD         = 120
-GOLDEN_CROSS_WINDOW = 3
+GOLDEN_CROSS_WINDOW = 7
 
 # ──────────────────────────────────────────
 # 유틸
