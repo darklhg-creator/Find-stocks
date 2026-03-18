@@ -1,109 +1,362 @@
+"""
+추세 모멘텀 전략 봇 (MACD + DMI/ADX + 이격도)
+=============================================
+전략 조건:
+  1단계) MACD 골든크로스: MACD선이 시그널선을 상향 돌파 (오늘 크로스 발생)
+  2단계) PDI > MDI: 매수세가 매도세 위에 있음
+  3단계) ADX 상승 + 20 이상: 추세가 강화되고 있음
+  추가)  이격도 95~105%: 거품 없이 추세 초입 구간
+
+실행 방법:
+  pip install pykrx finance-datareader pandas requests
+  python trend_momentum_bot.py
+
+GitHub Actions 환경변수:
+  DISCORD_WEBHOOK_URL : Discord 웹훅 URL
+"""
+
+import os
+import time
 import requests
-from pykrx import stock
 import pandas as pd
-from datetime import datetime, timedelta, timezone
+import FinanceDataReader as fdr
+from pykrx import stock
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 🔴 디스코드 웹후크 URL
-WEBHOOK_URL = "https://discord.com/api/webhooks/1466732864392397037/roekkL5WS9fh8uQnm6Bjcul4C8MDo1gsr1ZmzGh8GfuomzlJ5vpZdVbCaY--_MZOykQ4"
+# ──────────────────────────────────────────
+# 설정값
+# ──────────────────────────────────────────
+DISCORD_WEBHOOK_URL = os.environ.get(
+    "DISCORD_WEBHOOK_URL",
+    "https://discord.com/api/webhooks/1466732864392397037/roekkL5WS9fh8uQnm6Bjcul4C8MDo1gsr1ZmzGh8GfuomzlJ5vpZdVbCaY--_MZOykQ4"
+)
 
-EXCLUDE_KEYWORDS = [
-    '미국', '차이나', '중국', '일본', '나스닥', 'S&P', '글로벌', 'MSCI', '인도', '베트남', 
-    '필라델피아', '레버리지', '인버스', '블룸버그', '항셍', '니케이', '빅테크', 'TSMC', 
-    '대만', '유로', '스톡스', '선물', '채권', '국고채', '머니마켓', 'KOFR', 'CD금리', '달러', '엔화'
-]
+# 이격도 범위
+DISPARITY_MIN = 95.0
+DISPARITY_MAX = 105.0
+MA_PERIOD = 20           # 이격도 기준 이동평균
 
-def send_discord_message(msg_content):
-    payload = {"content": msg_content}
+# MACD 파라미터
+MACD_FAST   = 12
+MACD_SLOW   = 26
+MACD_SIGNAL = 9
+
+# ADX 파라미터
+ADX_PERIOD     = 14
+ADX_MIN        = 20      # ADX가 이 값 이상이어야 추세 인정
+ADX_RISING_DAYS = 3      # 최근 N일 연속 ADX가 상승해야 함
+
+# 기타 필터
+MIN_VOLUME_20D = 100_000  # 20일 평균 거래량 최소치
+MAX_WORKERS    = 5        # 멀티스레딩 워커 수
+DATA_PERIOD    = 120      # 지표 계산에 필요한 캔들 수 (영업일)
+
+# ──────────────────────────────────────────
+# 유틸: 날짜 계산
+# ──────────────────────────────────────────
+def get_date_range(days: int = DATA_PERIOD):
+    """오늘부터 days 영업일 전 날짜 반환 (넉넉하게 캘린더 기준 2배 확보)"""
+    end   = datetime.today()
+    start = end - timedelta(days=days * 2)
+    return start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+
+def today_str():
+    return datetime.today().strftime("%Y-%m-%d")
+
+# ──────────────────────────────────────────
+# 지표 계산 함수
+# ──────────────────────────────────────────
+def calc_macd(close: pd.Series):
+    """MACD, Signal, Histogram 반환"""
+    ema_fast   = close.ewm(span=MACD_FAST,   adjust=False).mean()
+    ema_slow   = close.ewm(span=MACD_SLOW,   adjust=False).mean()
+    macd       = ema_fast - ema_slow
+    signal     = macd.ewm(span=MACD_SIGNAL, adjust=False).mean()
+    histogram  = macd - signal
+    return macd, signal, histogram
+
+
+def calc_dmi_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = ADX_PERIOD):
+    """PDI, MDI, ADX 반환"""
+    tr_list, pdi_list, mdi_list = [], [], []
+
+    for i in range(1, len(close)):
+        h, l, pc = high.iloc[i], low.iloc[i], close.iloc[i - 1]
+        tr  = max(h - l, abs(h - pc), abs(l - pc))
+        pdm = max(h - high.iloc[i - 1], 0)
+        mdm = max(low.iloc[i - 1] - l, 0)
+        if pdm < mdm: pdm = 0
+        if mdm < pdm: mdm = 0
+        tr_list.append(tr)
+        pdi_list.append(pdm)
+        mdi_list.append(mdm)
+
+    tr_s   = pd.Series(tr_list)
+    pdi_s  = pd.Series(pdi_list)
+    mdi_s  = pd.Series(mdi_list)
+
+    atr    = tr_s.ewm(span=period, adjust=False).mean()
+    pdi    = 100 * pdi_s.ewm(span=period, adjust=False).mean() / atr
+    mdi    = 100 * mdi_s.ewm(span=period, adjust=False).mean() / atr
+
+    dx     = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, 1e-9)
+    adx    = dx.ewm(span=period, adjust=False).mean()
+
+    return pdi, mdi, adx
+
+
+def calc_disparity(close: pd.Series, period: int = MA_PERIOD):
+    """이격도(%) = 현재가 / MA * 100"""
+    ma = close.rolling(period).mean()
+    return (close / ma * 100).iloc[-1]
+
+
+# ──────────────────────────────────────────
+# 종목 분석 핵심 로직
+# ──────────────────────────────────────────
+def analyze_ticker(ticker: str, name: str) -> dict | None:
+    """
+    단일 종목을 분석해 조건 충족 시 결과 dict 반환, 미충족 시 None
+    """
     try:
-        requests.post(WEBHOOK_URL, json=payload)
-    except Exception as e:
-        print(f"❌ 전송 에러: {e}")
+        start, end = get_date_range()
+        df = fdr.DataReader(ticker, start, end)
+        if df is None or len(df) < MACD_SLOW + MACD_SIGNAL + ADX_PERIOD + 10:
+            return None
 
+        df = df.dropna(subset=["Close", "High", "Low", "Volume"])
+        df = df.sort_index()
+
+        close  = df["Close"].astype(float)
+        high   = df["High"].astype(float)
+        low    = df["Low"].astype(float)
+        volume = df["Volume"].astype(float)
+
+        # ── 거래량 필터 ──────────────────────
+        avg_vol = volume.iloc[-20:].mean()
+        if avg_vol < MIN_VOLUME_20D:
+            return None
+
+        # ── MACD 계산 ────────────────────────
+        macd, signal, hist = calc_macd(close)
+        if len(macd) < 2:
+            return None
+
+        # 최근 3일 이내 골든크로스 확인
+        # 조건: i일 전에 macd <= signal 이었다가 그 다음날 macd > signal 로 전환된 적이 있는지
+        GOLDEN_CROSS_WINDOW = 3
+        golden_cross_found = False
+        for i in range(1, GOLDEN_CROSS_WINDOW + 1):
+            if len(macd) < i + 2:
+                break
+            # -i-1 일: 크로스 전 (macd <= signal)
+            # -i   일: 크로스 발생 (macd > signal)
+            before = macd.iloc[-i - 1] <= signal.iloc[-i - 1]
+            after  = macd.iloc[-i]      > signal.iloc[-i]
+            if before and after:
+                golden_cross_found = True
+                break
+
+        if not golden_cross_found:
+            return None
+
+        # 골든크로스 발생일 기록 (Discord 표시용)
+        golden_cross_today = (macd.iloc[-2] <= signal.iloc[-2] and macd.iloc[-1] > signal.iloc[-1])
+
+        # ── DMI / ADX 계산 ───────────────────
+        pdi, mdi, adx = calc_dmi_adx(high, low, close)
+        if len(adx) < ADX_RISING_DAYS + 1:
+            return None
+
+        pdi_now = pdi.iloc[-1]
+        mdi_now = mdi.iloc[-1]
+        adx_now = adx.iloc[-1]
+
+        # 2단계: PDI > MDI
+        if pdi_now <= mdi_now:
+            return None
+
+        # 3단계: ADX >= 20 & 연속 상승
+        if adx_now < ADX_MIN:
+            return None
+        adx_rising = all(
+            adx.iloc[-i] > adx.iloc[-i - 1]
+            for i in range(1, ADX_RISING_DAYS + 1)
+        )
+        if not adx_rising:
+            return None
+
+        # ── 이격도 계산 ──────────────────────
+        if len(close) < MA_PERIOD:
+            return None
+        disparity = calc_disparity(close)
+        if not (DISPARITY_MIN <= disparity <= DISPARITY_MAX):
+            return None
+
+        current_price = close.iloc[-1]
+
+        return {
+            "ticker"      : ticker,
+            "name"        : name,
+            "price"       : int(current_price),
+            "disparity"   : round(disparity, 2),
+            "macd"        : round(macd.iloc[-1], 4),
+            "signal"      : round(signal.iloc[-1], 4),
+            "pdi"         : round(pdi_now, 2),
+            "mdi"         : round(mdi_now, 2),
+            "adx"         : round(adx_now, 2),
+            "golden_cross": golden_cross_today,
+            "avg_vol"     : int(avg_vol),
+        }
+
+    except Exception:
+        return None
+
+
+# ──────────────────────────────────────────
+# 종목 리스트 수집
+# ──────────────────────────────────────────
+def get_stock_list() -> list[tuple[str, str]]:
+    """KOSPI 상위 500 + KOSDAQ 상위 1000 종목 반환 (ticker, name)"""
+    today = datetime.today().strftime("%Y%m%d")
+    results = []
+
+    try:
+        # KOSPI 시가총액 상위 500
+        kospi_cap = stock.get_market_cap_by_ticker(today, market="KOSPI")
+        kospi_cap = kospi_cap.sort_values("시가총액", ascending=False).head(500)
+        for ticker in kospi_cap.index:
+            try:
+                name = stock.get_market_ticker_name(ticker)
+                results.append((ticker, name))
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[WARN] KOSPI 리스트 수집 실패: {e}")
+
+    try:
+        # KOSDAQ 시가총액 상위 1000
+        kosdaq_cap = stock.get_market_cap_by_ticker(today, market="KOSDAQ")
+        kosdaq_cap = kosdaq_cap.sort_values("시가총액", ascending=False).head(1000)
+        for ticker in kosdaq_cap.index:
+            try:
+                name = stock.get_market_ticker_name(ticker)
+                results.append((ticker, name))
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[WARN] KOSDAQ 리스트 수집 실패: {e}")
+
+    print(f"[INFO] 총 분석 대상 종목 수: {len(results)}")
+    return results
+
+
+# ──────────────────────────────────────────
+# Discord 알림
+# ──────────────────────────────────────────
+def send_discord(content: str):
+    if not DISCORD_WEBHOOK_URL:
+        print("[WARN] DISCORD_WEBHOOK_URL 환경변수가 없습니다. 콘솔에만 출력합니다.")
+        print(content)
+        return
+    payload = {"content": content}
+    try:
+        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+        if resp.status_code not in (200, 204):
+            print(f"[WARN] Discord 전송 실패: {resp.status_code}")
+    except Exception as e:
+        print(f"[ERROR] Discord 전송 오류: {e}")
+
+
+def format_discord_message(results: list[dict]) -> list[str]:
+    """결과를 Discord 메시지 리스트로 변환 (2000자 제한 분할)"""
+    today = today_str()
+    header = (
+        f"📈 **추세 모멘텀 전략 알림** | {today}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"조건: MACD골든크로스 + PDI>MDI + ADX≥{ADX_MIN}(상승) + 이격도 {DISPARITY_MIN}~{DISPARITY_MAX}%\n"
+        f"총 {len(results)}개 종목 발견\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    if not results:
+        return [header + "⚠️ 조건을 충족하는 종목이 없습니다."]
+
+    messages = [header]
+    chunk = ""
+
+    for r in results:
+        cross_tag = "🔥골든크로스" if r["golden_cross"] else "✅MACD↑"
+        line = (
+            f"\n**{r['name']}** ({r['ticker']})\n"
+            f"  💰 현재가: {r['price']:,}원  |  📊 이격도: {r['disparity']}%\n"
+            f"  {cross_tag}  |  PDI {r['pdi']} > MDI {r['mdi']}  |  ADX {r['adx']}\n"
+            f"  MACD: {r['macd']} / Signal: {r['signal']}\n"
+            f"  거래량(20일평균): {r['avg_vol']:,}\n"
+        )
+
+        if len(chunk) + len(line) > 1800:
+            messages.append(chunk)
+            chunk = line
+        else:
+            chunk += line
+
+    if chunk:
+        messages.append(chunk)
+
+    return messages
+
+
+# ──────────────────────────────────────────
+# 메인 실행
+# ──────────────────────────────────────────
 def main():
-    KST = timezone(timedelta(hours=9))
-    today_dt = datetime.now(KST)
-    target_date = today_dt.strftime("%Y%m%d")
-    
-    # 주말 작동 방지
-    if today_dt.weekday() >= 5:
-        print("💤 주말입니다. 분석을 쉬어갑니다.")
+    print(f"[START] 추세 모멘텀 전략 봇 시작 | {today_str()}")
+    start_time = time.time()
+
+    stock_list = get_stock_list()
+    if not stock_list:
+        send_discord("❌ 종목 리스트를 가져오지 못했습니다.")
         return
 
-    try:
-        # 1. 영업일 조회 (KODEX 200 데이터 활용 - 에러 없는 가장 안전한 방식)
-        dt_start = (today_dt - timedelta(days=10)).strftime("%Y%m%d")
-        df_days = stock.get_market_ohlcv(dt_start, target_date, "069500")
-        
-        if df_days.empty or len(df_days) < 2:
-            print("❌ 장이 열린 날짜 데이터를 확인할 수 없습니다.")
-            return
-            
-        b_days = df_days.index.strftime("%Y%m%d").tolist()
-        curr_date = b_days[-1] # 오늘(또는 가장 최근 영업일)
-        prev_date = b_days[-2] # 어제(또는 그 직전 영업일)
-        
-        print(f"📡 데이터 조회: 오늘({curr_date}) / 어제({prev_date})")
+    results = []
+    done = 0
 
-        # 2. 어제와 오늘 데이터 각각 통째로 가져오기
-        df_curr = stock.get_etf_ohlcv_by_ticker(curr_date)
-        df_prev = stock.get_etf_ohlcv_by_ticker(prev_date)
-        
-        if df_curr.empty or df_prev.empty:
-            print("❌ 시세 데이터를 불러오지 못했습니다.")
-            return
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(analyze_ticker, ticker, name): (ticker, name)
+            for ticker, name in stock_list
+        }
+        for future in as_completed(futures):
+            done += 1
+            if done % 100 == 0:
+                print(f"  진행: {done}/{len(stock_list)}")
+            result = future.result()
+            if result:
+                results.append(result)
 
-        results = []
+    # ADX 내림차순 정렬 (추세 강도 높은 순)
+    results.sort(key=lambda x: x["adx"], reverse=True)
 
-        # 3. [유저 아이디어 반영] 직관적이고 확실한 직접 계산 로직
-        for ticker in df_curr.index:
-            # 어제 데이터가 없는 신규 상장 종목 등은 패스
-            if ticker not in df_prev.index:
-                continue
-                
-            name = stock.get_etf_ticker_name(ticker)
-            
-            # 필터링
-            if any(word in name for word in EXCLUDE_KEYWORDS): 
-                continue
-            
-            # 어제 종가, 오늘 종가, 오늘 거래대금 추출
-            prev_close = float(df_prev.loc[ticker, '종가'])
-            curr_close = float(df_curr.loc[ticker, '종가'])
-            curr_amt = float(df_curr.loc[ticker, '거래대금'])
-            
-            if prev_close == 0: continue # 에러 방지
-            
-            # 등락률 직접 계산
-            change_rate = ((curr_close - prev_close) / prev_close) * 100
-            
-            # 상승한 종목만 담기
-            if change_rate > 0:
-                results.append({
-                    '종목명': name,
-                    '상승률': change_rate,
-                })
+    elapsed = round(time.time() - start_time, 1)
+    print(f"[DONE] 소요시간: {elapsed}초 | 조건 충족: {len(results)}개")
 
-        # 4. 결과 정렬 및 전송
-        if results:
-            final_df = pd.DataFrame(results).sort_values(by='상승률', ascending=False).head(30)
-            
-            # 소수점 2자리 포맷팅
-            final_df['상승률'] = final_df['상승률'].map(lambda x: f"{x:.2f}%")
+    messages = format_discord_message(results)
+    for msg in messages:
+        send_discord(msg)
+        time.sleep(0.5)  # Discord rate limit 방지
 
-            discord_msg = f"🚀 **[오늘의 국내 ETF 상승률 TOP 10]** ({today_dt.strftime('%Y-%m-%d')})\n"
-            discord_msg += "```text\n"
-            discord_msg += final_df.to_string(index=False) + "\n"
-            discord_msg += "```\n"
-            
-            send_discord_message(discord_msg)
-            print("✅ 분석 및 디스코드 전송 완료!")
-            print(final_df)
-        else:
-            print("⚠️ 조건에 맞는 상승 종목이 없습니다.")
+    # 콘솔 요약 출력
+    print("\n── 결과 요약 ──────────────────────────")
+    for r in results:
+        print(
+            f"  {r['name']:12s} ({r['ticker']}) | "
+            f"이격도 {r['disparity']:6.2f}% | "
+            f"ADX {r['adx']:5.1f} | "
+            f"PDI {r['pdi']:5.1f} > MDI {r['mdi']:5.1f}"
+        )
 
-    except Exception as e:
-        print(f"❌ 최종 오류 발생: {e}")
 
 if __name__ == "__main__":
     main()
-
