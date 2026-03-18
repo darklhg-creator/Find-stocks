@@ -1,29 +1,32 @@
-name: ETF Leader Tracker best
+name: 추세 모멘텀 전략 봇 (MACD+DMI+ADX)
 
 on:
   schedule:
-    # 월~금(1-5), UTC 기준 08:00 = 한국 시간(KST) 17:00 (오후 5시)
-    - cron: '0 8 * * 1-5' 
-  workflow_dispatch: # 👈 깃허브 페이지에서 수동으로 당장 실행해볼 수 있는 버튼 생성
+    # 한국 장 마감 후 오후 4시 30분 (UTC 07:30)
+    - cron: '30 7 * * 1-5'
+  workflow_dispatch:  # 수동 실행 허용
 
 jobs:
-  run-tracker:
-    runs-on: ubuntu-latest # 깃허브가 제공하는 리눅스 서버 사용
+  run-trend-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
-    - name: 저장소 코드 가져오기
-      uses: actions/checkout@v3
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
 
-    - name: 파이썬 환경 세팅
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10' # 가장 안정적인 파이썬 3.10 버전 사용
+      - name: Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
 
-    - name: 필수 라이브러리 설치 (pykrx, pandas, requests)
-      run: |
-        python -m pip install --upgrade pip
-        pip install pykrx pandas requests
+      - name: 패키지 설치
+        run: |
+          pip install --upgrade pip
+          pip install pykrx finance-datareader pandas requests
 
-    - name: 주도주 탐색 파이썬 스크립트 실행
-      run: python start.py
-
+      - name: 봇 실행
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python start.py
